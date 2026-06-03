@@ -52,6 +52,35 @@ logger = logging.getLogger(__name__)
 # Sentinel pushed onto the queue to end ``events()`` iteration.
 _CLOSED = object()
 
+# The agent (`run_agent`) may emit JSON-RPC lines up to ~50 MB (e.g. a browser
+# screenshot in a tool result). The default asyncio StreamReader line limit is
+# 64 KB, which would drop the connection on a big tool payload — match the
+# agent's buffer so large messages stream through (same as service.py).
+_STDIO_BUFFER_LIMIT = 50 * 1024 * 1024
+
+
+def _open_agent_stderr_log() -> tuple[int | None, str | None]:
+    """Open a file to receive the agent subprocess's stderr.
+
+    ``spawn_agent_process`` defaults the child's stderr to an *unread* PIPE.
+    Chatty tools (Chromium via ``browser_use``) flood it, fill the 64 KB pipe
+    buffer, block the agent, and the JSON-RPC stream dies ("Connection
+    closed"). Draining stderr to a file avoids the deadlock and keeps the logs
+    for debugging. Falls back to ``DEVNULL`` if the file can't be opened.
+    """
+    try:
+        from ....constant import WORKING_DIR
+
+        path = str(WORKING_DIR / "qwenpaw-tui-acp.log")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        return fd, path
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("falling back to DEVNULL for agent stderr: %s", exc)
+        try:
+            return os.open(os.devnull, os.O_WRONLY), None
+        except Exception:  # noqa: BLE001
+            return None, None
+
 
 def _kill_process_tree(pid: int) -> None:
     """Best-effort recursive kill (mirrors acp/service.py fix #4615)."""
@@ -195,6 +224,8 @@ class AcpTransport:
         self._process: Any = None
         self._session_id: str | None = None
         self._prompt_task: asyncio.Task[Any] | None = None
+        self._stderr_fd: int | None = None
+        self._stderr_path: str | None = None
         self._closed = False
 
     @property
@@ -204,6 +235,10 @@ class AcpTransport:
     async def start(self) -> Connected:
         self._stack = AsyncExitStack()
         cmd, *args = self._command
+        self._stderr_fd, self._stderr_path = _open_agent_stderr_log()
+        transport_kwargs: dict[str, Any] = {"limit": _STDIO_BUFFER_LIMIT}
+        if self._stderr_fd is not None:
+            transport_kwargs["stderr"] = self._stderr_fd
         self._conn, self._process = await self._stack.enter_async_context(
             spawn_agent_process(
                 self._client,
@@ -211,6 +246,7 @@ class AcpTransport:
                 *args,
                 cwd=self._cwd,
                 env={**os.environ},
+                transport_kwargs=transport_kwargs,
             )
         )
         initialized = await self._conn.initialize(
@@ -330,6 +366,12 @@ class AcpTransport:
                 await self._stack.aclose()
             except Exception:  # noqa: BLE001
                 pass
+        if self._stderr_fd is not None:
+            try:
+                os.close(self._stderr_fd)
+            except OSError:
+                pass
+            self._stderr_fd = None
         await self._queue.put(_CLOSED)
 
 

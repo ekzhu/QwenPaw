@@ -544,6 +544,15 @@ shapes the console already parses.
   TUI targets the conversational core, which ACP models well.
 - **Two transports drifting** → enforced by the shared `TuiEvent` contract and
   the parity test in §6.3.
+- **Agent-subprocess stdio pitfalls** (learned in testing) → `spawn_agent_process`
+  defaults the child's **stderr to an unread PIPE**; a chatty tool (Chromium via
+  `browser_use`) floods it, the 64 KB pipe fills, the agent blocks, and the
+  JSON-RPC stream dies ("Connection closed"). `AcpTransport` therefore redirects
+  the agent's stderr to a drained log file (`WORKING_DIR/qwenpaw-tui-acp.log`),
+  and raises the stdio read **`limit` to 50 MB** so large tool results (e.g. a
+  base64 screenshot on one JSON-RPC line) don't exceed the default 64 KB reader
+  limit and drop the connection. Both match the agent side (`run_agent`'s 50 MB
+  default).
 
 ---
 
