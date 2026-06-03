@@ -1,0 +1,354 @@
+# -*- coding: utf-8 -*-
+"""Default TUI transport: drive ``qwenpaw acp`` over ACP/stdio.
+
+The transport spawns ``qwenpaw acp`` as a subprocess and connects an ACP
+client to it (the same ``spawn_agent_process`` plumbing the in-process ACP
+service uses, see ``qwenpaw/agents/acp/service.py``). All agent capabilities —
+tools, memory, slash commands, permissions, model switching — come for free
+because the ACP server already exposes them.
+
+The client object is duck-typed (mirroring ``ACPHostedClient``): the connection
+only ever calls ``session_update``, ``request_permission`` and the ``ext_*``
+hooks for the QwenPaw agent, so we implement exactly those.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+import uuid
+from contextlib import AsyncExitStack
+from typing import Any, AsyncIterator
+
+from acp import (
+    PROTOCOL_VERSION,
+    spawn_agent_process,
+    text_block,
+)
+from acp.schema import (
+    AllowedOutcome,
+    ClientCapabilities,
+    DeniedOutcome,
+    Implementation,
+    RequestPermissionResponse,
+)
+
+from ....__version__ import __version__
+from ..events import (
+    Connected,
+    PermissionOption,
+    PermissionRequest,
+    PushMessage,
+    TransportError,
+    TurnEnded,
+    TuiEvent,
+)
+from ..normalize import normalize_update
+
+logger = logging.getLogger(__name__)
+
+# Sentinel pushed onto the queue to end ``events()`` iteration.
+_CLOSED = object()
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Best-effort recursive kill (mirrors acp/service.py fix #4615)."""
+    try:
+        import psutil  # local import; psutil is already a QwenPaw dep
+    except Exception:  # pragma: no cover - psutil always present in app
+        return
+    try:
+        parent = psutil.Process(pid)
+    except Exception:
+        return
+    for child in parent.children(recursive=True):
+        try:
+            child.kill()
+        except Exception:
+            pass
+    try:
+        parent.kill()
+    except Exception:
+        pass
+
+
+class _TuiClient:
+    """ACP client callbacks → push normalized events onto a queue."""
+
+    def __init__(self, queue: "asyncio.Queue[Any]") -> None:
+        self._queue = queue
+        self._pending: dict[str, asyncio.Future[str | None]] = {}
+
+    # -- connection lifecycle ------------------------------------------------
+    def on_connect(self, conn: Any) -> None:  # noqa: D401 - ACP hook
+        self._conn = conn
+
+    # -- streaming updates ---------------------------------------------------
+    async def session_update(
+        self, session_id: str, update: Any, **_: Any
+    ) -> None:
+        del session_id
+        for event in normalize_update(update):
+            await self._queue.put(event)
+
+    # -- permission round-trip ----------------------------------------------
+    async def request_permission(
+        self,
+        options: list[Any],
+        session_id: str,
+        tool_call: Any,
+        **_: Any,
+    ) -> RequestPermissionResponse:
+        del session_id
+        request_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str | None] = loop.create_future()
+        self._pending[request_id] = future
+
+        title = (
+            getattr(tool_call, "title", None)
+            or getattr(tool_call, "tool_call_id", None)
+            or "Permission required"
+        )
+        await self._queue.put(
+            PermissionRequest(
+                request_id=request_id,
+                title=str(title),
+                tool_kind=getattr(tool_call, "kind", None),
+                options=[
+                    PermissionOption(
+                        option_id=getattr(o, "option_id", ""),
+                        name=getattr(o, "name", "")
+                        or getattr(o, "option_id", ""),
+                        kind=getattr(o, "kind", "allow_once"),
+                    )
+                    for o in options
+                ],
+            )
+        )
+
+        try:
+            option_id = await future
+        finally:
+            self._pending.pop(request_id, None)
+
+        if option_id is None:
+            return RequestPermissionResponse(
+                outcome=DeniedOutcome(outcome="cancelled")
+            )
+        return RequestPermissionResponse(
+            outcome=AllowedOutcome(outcome="selected", option_id=option_id)
+        )
+
+    def resolve(self, request_id: str, option_id: str | None) -> None:
+        future = self._pending.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(option_id)
+
+    def cancel_pending(self) -> None:
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.set_result(None)
+        self._pending.clear()
+
+    # -- extensions: server-initiated push (design §4.3) --------------------
+    async def ext_notification(
+        self, method: str, params: dict[str, Any]
+    ) -> None:
+        if method in ("qwenpaw/push_message", "session/push_message"):
+            text = str(params.get("text") or params.get("message") or "")
+            if text:
+                await self._queue.put(PushMessage(text))
+        # Unknown notifications are ignored (degrade gracefully).
+
+    async def ext_method(
+        self, method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        del params
+        logger.debug("Ignoring unsupported ACP ext method: %s", method)
+        return {}
+
+
+class AcpTransport:
+    """Spawns ``qwenpaw acp`` and drives one session over ACP/stdio."""
+
+    def __init__(
+        self,
+        *,
+        agent: str | None = None,
+        cwd: str | None = None,
+        command: list[str] | None = None,
+    ) -> None:
+        self._agent = agent
+        self._cwd = cwd or os.getcwd()
+        # Default: re-invoke this very interpreter as `python -m qwenpaw acp`.
+        self._command = command or [sys.executable, "-m", "qwenpaw", "acp"]
+        if agent:
+            self._command += ["--agent", agent]
+
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._client = _TuiClient(self._queue)
+        self._stack: AsyncExitStack | None = None
+        self._conn: Any = None
+        self._process: Any = None
+        self._session_id: str | None = None
+        self._prompt_task: asyncio.Task[Any] | None = None
+        self._closed = False
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    async def start(self) -> Connected:
+        self._stack = AsyncExitStack()
+        cmd, *args = self._command
+        self._conn, self._process = await self._stack.enter_async_context(
+            spawn_agent_process(
+                self._client,
+                cmd,
+                *args,
+                cwd=self._cwd,
+                env={**os.environ},
+            )
+        )
+        initialized = await self._conn.initialize(
+            protocol_version=PROTOCOL_VERSION,
+            client_capabilities=ClientCapabilities(),
+            client_info=Implementation(
+                name="qwenpaw-tui", version=__version__
+            ),
+        )
+        if initialized.protocol_version != PROTOCOL_VERSION:
+            logger.warning(
+                "ACP protocol mismatch: agent=%s client=%s",
+                initialized.protocol_version,
+                PROTOCOL_VERSION,
+            )
+        new_session = await self._conn.new_session(cwd=self._cwd)
+        self._session_id = new_session.session_id
+        return Connected(
+            session_id=self._session_id,
+            agent=self._agent,
+            model=_current_model(new_session),
+        )
+
+    async def send(self, text: str) -> None:
+        if self._conn is None or self._session_id is None:
+            raise RuntimeError("transport not started")
+        if self._prompt_task is not None and not self._prompt_task.done():
+            raise RuntimeError("a turn is already in progress")
+        self._prompt_task = asyncio.create_task(self._run_prompt(text))
+
+    async def _run_prompt(self, text: str) -> None:
+        stop_reason: str | None = None
+        try:
+            response = await self._conn.prompt(
+                prompt=[text_block(text)],
+                session_id=self._session_id,
+            )
+            stop_reason = getattr(response, "stop_reason", None)
+            # The ACP connection resolves the prompt *response* inline but
+            # dispatches session_update *notifications* via an async queue, so
+            # prompt() can return before the final tool/text update has been
+            # delivered. Let those in-flight updates land so TurnEnded is last.
+            await self._settle()
+        except asyncio.CancelledError:
+            stop_reason = "cancelled"
+            raise
+        except Exception as exc:  # noqa: BLE001 - surface to UI, don't crash
+            await self._queue.put(TransportError(str(exc)))
+        finally:
+            await self._queue.put(TurnEnded(stop_reason=stop_reason))
+
+    async def _settle(self, *, max_idle: int = 3) -> None:
+        """Yield until the event queue stops growing (in-flight notifications
+        have all been enqueued). Bounded and cheap: each ``sleep(0)`` lets one
+        queued ACP notification task run."""
+        idle = 0
+        while idle < max_idle:
+            before = self._queue.qsize()
+            await asyncio.sleep(0)
+            if self._queue.qsize() == before:
+                idle += 1
+            else:
+                idle = 0
+
+    async def interrupt(self) -> None:
+        if self._conn is None or self._session_id is None:
+            return
+        # Free any blocked permission first so the prompt task can unwind.
+        self._client.cancel_pending()
+        try:
+            await self._conn.cancel(session_id=self._session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cancel failed: %s", exc)
+
+    async def resolve_permission(
+        self, request_id: str, option_id: str | None
+    ) -> None:
+        self._client.resolve(request_id, option_id)
+
+    async def set_model(self, model_id: str) -> None:
+        if self._conn is None or self._session_id is None:
+            return
+        await self._conn.set_session_model(
+            model_id=model_id, session_id=self._session_id
+        )
+
+    async def events(self) -> AsyncIterator[TuiEvent]:
+        while True:
+            item = await self._queue.get()
+            if item is _CLOSED:
+                return
+            yield item
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._client.cancel_pending()
+        if self._prompt_task is not None and not self._prompt_task.done():
+            self._prompt_task.cancel()
+            try:
+                await self._prompt_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if self._conn is not None and self._session_id is not None:
+            try:
+                await asyncio.wait_for(
+                    self._conn.close_session(session_id=self._session_id),
+                    timeout=5.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if self._process is not None:
+            _kill_process_tree(self._process.pid)
+        if self._stack is not None:
+            try:
+                await self._stack.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        await self._queue.put(_CLOSED)
+
+
+def _current_model(new_session: Any) -> str | None:
+    """Best-effort extraction of the current model name from new_session."""
+    models = getattr(new_session, "models", None)
+    if not models:
+        return None
+    current_id = getattr(models, "current_model_id", None) or getattr(
+        models, "current", None
+    )
+    available = getattr(models, "available_models", None) or getattr(
+        models, "models", None
+    )
+    if available:
+        for model in available:
+            mid = getattr(model, "model_id", None) or getattr(
+                model, "id", None
+            )
+            if mid == current_id:
+                return getattr(model, "name", None) or str(mid)
+    return str(current_id) if current_id else None

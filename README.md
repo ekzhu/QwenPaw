@@ -328,6 +328,35 @@ For detailed usage instructions, troubleshooting, and common issues, see the [De
 
 ---
 
+## Terminal chat
+
+Prefer the keyboard? Just run:
+
+```bash
+qwenpaw
+```
+
+With no subcommand, `qwenpaw` opens an interactive terminal chat (a Textual UI)
+that talks to your local agent — streaming replies, tool-call panels, and
+permission prompts, no browser needed. It works out of the box: the TUI spawns
+the agent over [ACP](https://agentclientprotocol.com/) in the background, so you
+don't need to start a server first.
+
+```bash
+qwenpaw chat                 # same as bare `qwenpaw`
+qwenpaw chat --agent writer  # chat with a specific agent
+qwenpaw chat -p "summarize my unread newsletters"   # one-shot, prints and exits
+qwenpaw --no-tui             # restore the old behavior (print help)
+```
+
+Inside the chat, slash commands like `/model`, `/clear`, `/compact`, and
+`/approval` work as usual (they're forwarded to the agent). Press `esc` to
+interrupt a turn and `ctrl+c` to quit. Power users can also drive the same agent
+from any ACP client (e.g. Zed) via `qwenpaw acp`. See the
+[design doc](docs/design/qwenpaw-cli-tui.md) for details.
+
+---
+
 ## API Key
 
 If you use a **cloud LLM API** (e.g., Qianwen, Gemini, OpenAI), you must configure an API key before chatting. QwenPaw will not work until a valid key is set. See the [official docs](https://qwenpaw.agentscope.io/docs/models) for details.

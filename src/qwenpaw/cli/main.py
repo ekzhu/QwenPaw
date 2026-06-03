@@ -94,9 +94,11 @@ class LazyGroup(click.Group):
 
 @click.group(
     cls=LazyGroup,
+    invoke_without_command=True,
     context_settings={"help_option_names": ["-h", "--help"]},
     lazy_subcommands={
         "acp": ("qwenpaw.cli.acp_cmd", "acp_cmd", ".acp_cmd"),
+        "chat": ("qwenpaw.cli.tui.launch", "chat_cmd", ".tui.launch"),
         "app": ("qwenpaw.cli.app_cmd", "app_cmd", ".app_cmd"),
         "channels": (
             "qwenpaw.cli.channels_cmd",
@@ -110,7 +112,6 @@ class LazyGroup(click.Group):
         ),
         "daemon": ("qwenpaw.cli.daemon_cmd", "daemon_group", ".daemon_cmd"),
         "chats": ("qwenpaw.cli.chats_cmd", "chats_group", ".chats_cmd"),
-        "chat": ("qwenpaw.cli.chats_cmd", "chats_group", ".chats_cmd"),
         "clean": ("qwenpaw.cli.clean_cmd", "clean_cmd", ".clean_cmd"),
         "cron": ("qwenpaw.cli.cron_cmd", "cron_group", ".cron_cmd"),
         "env": ("qwenpaw.cli.env_cmd", "env_group", ".env_cmd"),
@@ -153,9 +154,27 @@ class LazyGroup(click.Group):
     type=int,
     help="API Port",
 )
+@click.option(
+    "--agent",
+    default=None,
+    help="Agent ID for the terminal chat (bare `qwenpaw`).",
+)
+@click.option(
+    "--no-tui",
+    is_flag=True,
+    default=False,
+    help="Print help instead of launching the terminal chat when no "
+    "subcommand is given.",
+)
 @click.pass_context
-def cli(ctx: click.Context, host: str | None, port: int | None) -> None:
-    """QwenPaw CLI."""
+def cli(
+    ctx: click.Context,
+    host: str | None,
+    port: int | None,
+    agent: str | None,
+    no_tui: bool,
+) -> None:
+    """QwenPaw CLI — run with no subcommand to open the terminal chat."""
     # default from last run if not provided
     last = read_last_api()
     if host is None or port is None:
@@ -170,3 +189,13 @@ def cli(ctx: click.Context, host: str | None, port: int | None) -> None:
     ctx.ensure_object(dict)
     ctx.obj["host"] = host
     ctx.obj["port"] = port
+
+    # Bare `qwenpaw` (no subcommand) launches the interactive terminal chat.
+    # `--no-tui` restores the old behavior of printing help.
+    if ctx.invoked_subcommand is None:
+        if no_tui:
+            click.echo(ctx.get_help())
+            return
+        from .tui.launch import run_tui
+
+        run_tui(ctx, agent=agent)

@@ -133,3 +133,7 @@ e2e/reports/
 e2e/data/
 e2e/.pytest_cache/
 e2e/__pycache__/
+
+# Local development install (QwenPaw TUI dev setup)
+.devdata/
+.devdata.secret/
