@@ -207,9 +207,77 @@ Evidence that GA is imminent and the project is in stabilization mode:
    behavior-preserving refactor that also improves ACP-server testability.
 3. Land `LocalTransport` behind `PAW_TRANSPORT=local` as experimental in early
    2.1 betas; validate fd hygiene and responsiveness across macOS/Linux/Windows.
-4. Flip the default in a 2.1.x release; keep the subprocess transport selectable
-   for at least one more release as an escape hatch, and keep exercising the ACP
-   server in CI (the existing `test_acp_transport.py` + fake-agent harness).
+4. Only flip the default if the experimental phase clearly earns it (see §8 —
+   there is a solid architectural case for keeping the subprocess boundary
+   permanently); in any case keep the other transport selectable as an escape
+   hatch, and keep exercising the ACP server in CI (the existing
+   `test_acp_transport.py` + fake-agent harness).
+
+## 8. Addendum: is the subprocess architecture simply better?
+
+Beyond timing, there is a defensible position that the process boundary should be
+kept permanently. Process isolation is not one guarantee but four, and each maps to
+something concrete in this codebase:
+
+1. **Terminal ownership by construction.** A full-screen TUI is a renderer over a
+   serial device; any write to fd 1/2 corrupts it. Textual intercepts Python-level
+   `print`, but not C-level writes from native libraries or child processes.
+   QwenPaw's runtime executes *arbitrary third-party code by design* — user skills
+   are the product's core extension model — plus onnxruntime, tokenizers, mss, and
+   Chromium via browser-use (whose stderr flooding is already documented in
+   `transport/acp.py:82-102`). A subprocess makes display integrity unconditional:
+   nothing the runtime or any future skill prints can touch the screen. In-process,
+   integrity is a convention every dependency and every future contributor must
+   uphold.
+2. **Blast-radius control.** The realistic failure modes are not only segfaults:
+   OOM (the kernel kills the biggest process — better it be the backend than the
+   UI), native-extension crashes that don't unwind through Python (terminal left in
+   raw mode), and *soft* failures — a wedged event loop, leaked tasks, poisoned
+   process-global singletons (`ProviderManager.get_instance()`,
+   `get_approval_service()`, contextvars). With a subprocess, all of these are
+   recoverable by respawning the backend while the TUI, transcript, and queued
+   messages survive — the Jupyter "restart kernel" UX, which the current
+   architecture could offer as a `/restart` command almost for free. In-process,
+   the only clean recovery from corrupted global state is exiting the app.
+3. **Scheduling isolation.** Two processes give true parallelism. In-process, even
+   with a dedicated worker-thread loop, runtime CPU work (tokenization, embedding
+   pre/post-processing, JSON of large payloads) contends with rendering for the
+   GIL; a long native call that holds the GIL stalls the UI thread outright.
+4. **Inherited-context control.** The subprocess is spawned with the project
+   directory as cwd for Coding Mode (`launch.py`/`AcpTransport(cwd=project_dir)`),
+   its own env, its own signal disposition, its own fd table — and every tool child
+   it spawns inherits that context cleanly. In-process, each of these must be
+   re-implemented explicitly (a process-wide `os.chdir` in a UI process is its own
+   hazard).
+
+This is also the industry-consensus shape for "thin UI + heavy, extensible engine":
+LSP servers, DAP adapters, Jupyter kernels, Chrome's renderer split — and ACP itself
+exists because editors want agents out-of-process. The pattern holds wherever the
+engine is native-code-heavy or runs third-party code; QwenPaw's runtime is both.
+
+The honest cost accounting cuts the same way. The subprocess's costs are mostly
+**already paid, one-time fixes** (stderr redirect, buffer limits, kill-tree, quoting
+— all stable and encapsulated in ~150 lines of the transport), while the recurring
+cost — protocol friction per feature — is unusually low here because the ACP server
+must be maintained anyway for external editors, and the extracted-core refactor
+(§2 item 1) reduces that friction without moving the runtime in-process. The
+in-process design's costs run the other direction: recurring, user-facing risk
+(display integrity, UI stalls, unrecoverable state) that grows with every new
+dependency and skill. A fully hardened in-process design — worker-thread loop,
+OS-level fd redirection, wrapped child spawning, import isolation — converges on
+re-implementing half a process boundary by convention rather than construction.
+
+In-process is the right call when the runtime is small, pure-Python, async-clean,
+and entirely first-party (a REPL-style tool like aider fits). QwenPaw's runtime is
+none of these. **Recommendation, refined:** treat the subprocess as the durable
+architecture, and spend the effort on the boundary rather than dissolving it —
+persistent `list_sessions` + replay server-side, an event-driven approval bridge to
+replace the 250 ms poll, protocol-level fix for the update/response ordering that
+`_settle()` papers over, and optionally a backend `/restart` command that the
+boundary makes cheap. The `LocalTransport` experiment (§7 step 3) is still worth
+running behind a flag — it is the only way to measure the startup and integration
+wins with real numbers — but the default should move only if those numbers are
+compelling enough to justify giving up guarantees 1–4.
 
 ---
 
