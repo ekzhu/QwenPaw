@@ -162,11 +162,16 @@ def _probe_linux_landlock() -> (
 
     Detection steps:
         1. Kernel version >= 5.13
-        2. /sys/kernel/security/lsm contains "landlock"
+        2. /sys/kernel/security/lsm contains "landlock" (advisory: the
+           file is authoritative when readable, but securityfs is
+           usually not mounted inside containers, so an unreadable file
+           does not veto the probe)
         3. Attempt landlock_create_ruleset syscall to detect ABI version
+           (authoritative)
     """
     import ctypes
     import ctypes.util
+    import errno as errno_mod
     import os
 
     # Step 1: Check kernel version
@@ -188,21 +193,23 @@ def _probe_linux_landlock() -> (
             reason=f"Kernel {major}.{minor} < 5.13, Landlock unavailable",
         )
 
-    # Step 2: Check LSM list
+    # Step 2: Check LSM list. Authoritative only when readable: inside
+    # containers securityfs is typically not mounted (mounting it needs
+    # CAP_SYS_ADMIN), so the file being unreadable says nothing about
+    # kernel support — fall through to the syscall probe instead of
+    # concluding Landlock is unavailable (#5982).
+    lsm_list: Optional[str] = None
     try:
         with open("/sys/kernel/security/lsm", "r", encoding="utf-8") as f:
             lsm_list = f.read().strip()
-        if "landlock" not in lsm_list:
-            return SandboxCapability(
-                supported=False,
-                mode=SandboxMode.NONE,
-                reason=f"Landlock not in LSM list: {lsm_list}",
-            )
     except OSError:
+        pass
+
+    if lsm_list is not None and "landlock" not in lsm_list:
         return SandboxCapability(
             supported=False,
             mode=SandboxMode.NONE,
-            reason="Cannot read /sys/kernel/security/lsm",
+            reason=f"Landlock not in LSM list: {lsm_list}",
         )
 
     # Step 3: Probe ABI version via landlock_create_ruleset(
@@ -220,7 +227,7 @@ def _probe_linux_landlock() -> (
             SYS_landlock_create_ruleset = 444
         elif arch == "aarch64":
             SYS_landlock_create_ruleset = 444
-        else:
+        elif lsm_list is not None:
             # Fallback: assume support based on kernel + LSM check
             return SandboxCapability(
                 supported=True,
@@ -230,6 +237,17 @@ def _probe_linux_landlock() -> (
                     f"(ABI version unknown, arch={arch})"
                 ),
                 landlock_abi_version=1,
+            )
+        else:
+            # No syscall probe for this arch AND the LSM list was
+            # unreadable: no evidence either way, stay conservative.
+            return SandboxCapability(
+                supported=False,
+                mode=SandboxMode.NONE,
+                reason=(
+                    f"Cannot verify Landlock: LSM list unreadable and "
+                    f"no syscall probe for arch={arch}"
+                ),
             )
 
         LANDLOCK_CREATE_RULESET_VERSION = 1 << 0  # flags bit
@@ -252,11 +270,18 @@ def _probe_linux_landlock() -> (
 
         if abi_version < 0:
             errno = ctypes.get_errno()
+            hints = {
+                errno_mod.EPERM: "blocked by seccomp/security policy",
+                errno_mod.ENOSYS: "kernel built without Landlock",
+                errno_mod.EOPNOTSUPP: "Landlock disabled at boot",
+            }
+            hint = hints.get(errno)
             return SandboxCapability(
                 supported=False,
                 mode=SandboxMode.NONE,
                 reason=(
                     f"landlock_create_ruleset syscall failed, errno={errno}"
+                    + (f" ({hint})" if hint else "")
                 ),
             )
 

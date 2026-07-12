@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import errno
 import sys
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -108,13 +109,90 @@ class TestProbeLinuxLandlock:
         assert result.supported is False
         assert "not in LSM list" in result.reason
 
-    @patch("builtins.open", side_effect=OSError("Permission denied"))
+    @patch("platform.machine", return_value="x86_64")
+    @patch("builtins.open", side_effect=OSError("No such file or directory"))
     @patch("os.uname")
-    def test_lsm_file_unreadable(self, mock_uname, mock_file):
+    def test_lsm_file_unreadable_falls_through_to_syscall(
+        self,
+        mock_uname,
+        mock_file,
+        mock_machine,
+    ):
+        """Unreadable securityfs (e.g. in Docker) must not veto the
+        probe; the syscall decides (#5982)."""
         mock_uname.return_value = MagicMock(release="5.15.0-125-generic")
-        result = _probe_linux_landlock()
+
+        mock_libc = MagicMock()
+        mock_libc.syscall.return_value = 3  # ABI v3
+
+        with (
+            patch("ctypes.CDLL", return_value=mock_libc),
+            patch(
+                "ctypes.util.find_library",
+                return_value="libc.so.6",
+            ),
+        ):
+            result = _probe_linux_landlock()
+
+        assert result.supported is True
+        assert result.mode == SandboxMode.LANDLOCK
+        assert result.landlock_abi_version == 3
+
+    @patch("platform.machine", return_value="x86_64")
+    @patch("builtins.open", side_effect=OSError("No such file or directory"))
+    @patch("os.uname")
+    def test_lsm_file_unreadable_syscall_rejects(
+        self,
+        mock_uname,
+        mock_file,
+        mock_machine,
+    ):
+        """LSM list unreadable and the kernel rejects the syscall →
+        unsupported, with an errno hint in the reason."""
+        mock_uname.return_value = MagicMock(release="5.15.0-125-generic")
+
+        mock_libc = MagicMock()
+        mock_libc.syscall.return_value = -1
+
+        with (
+            patch("ctypes.CDLL", return_value=mock_libc),
+            patch(
+                "ctypes.util.find_library",
+                return_value="libc.so.6",
+            ),
+            patch("ctypes.get_errno", return_value=errno.EOPNOTSUPP),
+        ):
+            result = _probe_linux_landlock()
+
         assert result.supported is False
-        assert "Cannot read" in result.reason
+        assert f"errno={errno.EOPNOTSUPP}" in result.reason
+        assert "disabled at boot" in result.reason
+
+    @patch("platform.machine", return_value="riscv64")
+    @patch("builtins.open", side_effect=OSError("No such file or directory"))
+    @patch("os.uname")
+    def test_lsm_file_unreadable_unknown_arch_conservative(
+        self,
+        mock_uname,
+        mock_file,
+        mock_machine,
+    ):
+        """No syscall probe for the arch AND no LSM list: no evidence
+        of support, so the probe must stay conservative."""
+        mock_uname.return_value = MagicMock(release="6.6.0-generic")
+
+        with (
+            patch("ctypes.CDLL", return_value=MagicMock()),
+            patch(
+                "ctypes.util.find_library",
+                return_value="libc.so.6",
+            ),
+        ):
+            result = _probe_linux_landlock()
+
+        assert result.supported is False
+        assert result.mode == SandboxMode.NONE
+        assert "Cannot verify Landlock" in result.reason
 
     @patch("platform.machine", return_value="x86_64")
     @patch(
